@@ -109,14 +109,8 @@ PicoDisplay pico_display(buffer);
 
 const uint16_t white = pico_display.create_pen(255, 255, 255);
 const uint16_t black = pico_display.create_pen(0, 0, 0);
-const uint16_t red = pico_display.create_pen(255, 0, 0);
-const uint16_t green = pico_display.create_pen(0, 255, 0);
 const uint16_t dark_grey = pico_display.create_pen(20, 40, 60);
-const uint16_t dark_green = pico_display.create_pen(10, 100, 10);
-const uint16_t blue = pico_display.create_pen(0, 0, 255);
 const uint16_t yellow = pico_display.create_pen(255, 255, 0);
-const uint16_t magenta = pico_display.create_pen(255, 0, 255);
-const uint16_t cyan = pico_display.create_pen(0, 255, 255);
 
 const uint16_t rp_leaf = pico_display.create_pen(107,192,72);
 const uint16_t rp_berry = pico_display.create_pen(196,25,73);
@@ -295,12 +289,6 @@ int main() {
 
     update_game();
       
-    // pico_display.set_pen(dark_grey);
-    // pico_display.clear();
-    // for(int i = 0 ; i < num_bricks ; i++) {
-    //   draw_brick(bricks[i]);
-    // }
-
     update_ball();
     move_racket();
 
