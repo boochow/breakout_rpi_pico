@@ -1,3 +1,4 @@
+![Shape](https://raw.githubusercontent.com/boochow/breakout_rpi_pico/images/breakout_rpi_pico.jpg)
 # breakout_rpi_pico
 Breakout game for Raspberry Pi Pico with Pimoroni Pico Display pack
 
