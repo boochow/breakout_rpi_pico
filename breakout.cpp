@@ -242,8 +242,6 @@ void sound_on(float freq) {
 void sound_decay() {
     if (psg[0].sound_vol > 0) {
 	int v = psg[0].sound_vol * .85;
-//	int v = psg[0].sound_vol >> 1;
-//	v += v >> 1;
 	psg_vol(0, v);
 	psg_vol(1, v);
     }
