@@ -1,14 +1,8 @@
-![Shape](https://raw.githubusercontent.com/boochow/breakout_rpi_pico/images/breakout_rpi_pico.jpg)
-# breakout_rpi_pico
-Breakout game for Raspberry Pi Pico with Pimoroni Pico Display pack
+![Shape](https://raw.githubusercontent.com/boochow/breakout_rpi_pico/images/breakout_vga.jpg)
+# Pico Breakout for VGA
+Breakout game for Raspberry Pi Pico with VGA board. The sound is output to the PWM-audio jack.
 
-Prebuilt binary (`breakout.uf2`) is [here](https://github.com/boochow/breakout_rpi_pico/releases).
+Prebuilt binary (`breakout-vga.uf2`) is [here](https://github.com/boochow/breakout_rpi_pico/releases).
 
-To build your own binary by yourself, you need the [pimoroni-pico](https://github.com/pimoroni/pimoroni-pico) library.
+To build your own binary by yourself, you need the [pico-extras](https://github.com/raspberrypi/pico-extras) library.
 
-# controls
-Use X and Y to move the racket
-
-Press B for autoplay
-
-Press A for crazy speed

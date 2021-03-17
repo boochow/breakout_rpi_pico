@@ -1,15 +1,185 @@
 #include <string.h>
-#include <math.h>
 #include <cstdlib>
+#include "pico.h"
+#include "pico/scanvideo.h"
+#include "pico/scanvideo/composable_scanline.h"
+#include "hardware/irq.h"
+#include "hardware/pwm.h"
+#include "hardware/regs/rosc.h"
 
-#include "pico_display.hpp"
+// PWM sound generator
+
+#define PWM_AUDIO_L    (27)
+#define PWM_AUDIO_R    (28)
+#define RANDOMBIT      (*((uint *)(ROSC_BASE + ROSC_RANDOMBIT_OFFSET)) & 1)
+
+#define PWM_RANGE_BITS (10)
+#define PWM_RANGE      (1<<PWM_RANGE_BITS)
+#define NUM_PSG        (4)
+#define VOL_MAX        (PWM_RANGE / NUM_PSG - 1)
+#define SAMPLE_RATE    (125000000 / PWM_RANGE)
+#define OMEGA_UNIT     (FIXED_1_0 / SAMPLE_RATE)
+
+#define FIXED_0_5      (0x40000000)
+#define FIXED_1_0      (0x7fffffff)
+
+typedef uint32_t fixed; // 1.0=0x7fffffff, 0.0=0x0
+
+enum psg_type {OSC_SQUARE, OSC_SAW, OSC_TRI, OSC_NOISE};
+		 
+struct psg_t {
+    volatile fixed phase;       // 0..FIXED_1_0
+    fixed step;                 // 0..FIXED_1_0
+    volatile int sound_vol;     // 0..VOL_MAX
+    enum psg_type type;
+};
+
+static struct psg_t psg[NUM_PSG];
+
+void psg_freq(int i, float freq) {
+    assert(i < NUM_PSG);
+    psg[i].step = freq * OMEGA_UNIT; 
+}
+
+void psg_vol(int i, int value) {
+    assert(i < NUM_PSG);
+    if (value < 0) {
+	value = 0;
+    }
+    psg[i].sound_vol = value % (VOL_MAX + 1);
+}
+
+void psg_type(int i, enum psg_type type) {
+    assert(i < NUM_PSG);
+    psg[i].type = type;
+}
+
+static inline uint psg_value(int i) {
+    assert(i < NUM_PSG);
+    uint result;
+    if (psg[i].type == OSC_SQUARE) {
+	result = (psg[i].phase > FIXED_0_5) ? psg[i].sound_vol : 0;
+    } else if (psg[i].type == OSC_SAW) {
+	result = ((psg[i].phase >> (31 - PWM_RANGE_BITS)) * psg[i].sound_vol) >> PWM_RANGE_BITS;
+    } else if (psg[i].type == OSC_TRI) {
+	result = ((psg[i].phase >> (30 - PWM_RANGE_BITS)) * psg[i].sound_vol) >> PWM_RANGE_BITS;
+	result = (result < psg[i].sound_vol) ? result : psg[i].sound_vol * 2 - result;
+    } else { // OSC_NOISE
+	result = RANDOMBIT * psg[i].sound_vol;
+    }
+    return result;
+}
+
+static inline void psg_next() {
+    for(int i = 0; i < NUM_PSG; i++) {
+	psg[i].phase += psg[i].step;
+	if (psg[i].phase > FIXED_1_0) {
+	    psg[i].phase -= FIXED_1_0;
+	}
+    }
+}
+
+void on_pwm_wrap() {
+    uint sum = 0;
+    
+    pwm_clear_irq(pwm_gpio_to_slice_num(PWM_AUDIO_L));
+#ifdef PWM_AUDIO_R
+    pwm_clear_irq(pwm_gpio_to_slice_num(PWM_AUDIO_R));
+#endif
+    psg_next();
+    for(int i = 0; i < NUM_PSG; i++) {
+	sum += psg_value(i);
+    }
+    pwm_set_gpio_level(PWM_AUDIO_L, sum);
+#ifdef PWM_AUDIO_R
+    pwm_set_gpio_level(PWM_AUDIO_R, sum);
+#endif
+}
+
+void psg_pwm_config() {
+    gpio_set_function(PWM_AUDIO_L, GPIO_FUNC_PWM);
+#ifdef PWM_AUDIO_R
+    gpio_set_function(PWM_AUDIO_R, GPIO_FUNC_PWM);
+#endif
+    uint slice_num = pwm_gpio_to_slice_num(PWM_AUDIO_L);
+    pwm_clear_irq(slice_num);
+    pwm_set_irq_enabled(slice_num, true);
+    irq_set_exclusive_handler(PWM_IRQ_WRAP, on_pwm_wrap);
+    irq_set_enabled(PWM_IRQ_WRAP, true);
+    
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv_int(&config, 1);
+    pwm_config_set_wrap(&config, PWM_RANGE);
+    pwm_init(slice_num, &config, true);
+#ifdef PWM_AUDIO_R
+    slice_num = pwm_gpio_to_slice_num(PWM_AUDIO_R);
+    pwm_init(slice_num, &config, true);
+#endif
+}
+
+void psg_init() {
+    for(int i = 0; i < NUM_PSG; i++) {
+	psg[i].phase = 0;
+	psg[i].step = 0;
+	psg[i].sound_vol = VOL_MAX / 4;
+	psg[i].type = OSC_SQUARE;
+    }
+    psg_pwm_config();    
+}
+
+
+// scanning for the button states
+// this code is from pico-playground/apps/popcorn
+
+#define BUTTON_LEFT 1
+#define BUTTON_MIDDLE 2
+#define BUTTON_RIGHT 4
+
+volatile uint32_t button_state = 0;
+static const uint button_pins[] = {0, 6, 11};
+
+const uint VSYNC_PIN = PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_COLOR_PIN_COUNT + 1;
+
+// set pins to input. On deassertion, sample and set back to output.
+void vga_board_button_irq_handler() {
+    int vsync_current_level = gpio_get(VSYNC_PIN);
+    gpio_acknowledge_irq(VSYNC_PIN, vsync_current_level ? GPIO_IRQ_EDGE_RISE : GPIO_IRQ_EDGE_FALL);
+
+    // Note v_sync_polarity == 1 means active-low because anything else would be confusing
+    if (vsync_current_level != scanvideo_get_mode().default_timing->v_sync_polarity) {
+        for (int i = 0; i < count_of(button_pins); ++i) {
+            gpio_pull_down(button_pins[i]);
+            gpio_set_oeover(button_pins[i], GPIO_OVERRIDE_LOW);
+        }
+    } else {
+        uint32_t state = 0;
+        for (int i = 0; i < count_of(button_pins); ++i) {
+            state |= gpio_get(button_pins[i]) << i;
+            gpio_set_oeover(button_pins[i], GPIO_OVERRIDE_NORMAL);
+        }
+        button_state = state;
+    }
+}
+
+void vga_board_init_buttons() {
+    gpio_set_irq_enabled(VSYNC_PIN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
+    irq_set_exclusive_handler(IO_IRQ_BANK0, vga_board_button_irq_handler);
+    irq_set_enabled(IO_IRQ_BANK0, true);
+}
+
+// the game logic
+
+const uint16_t black     = PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0, 0);
+const uint16_t rp_leaf   = PICO_SCANVIDEO_PIXEL_FROM_RGB8(107,192,72);
+const uint16_t rp_berry  = PICO_SCANVIDEO_PIXEL_FROM_RGB8(196,25,73);
+const uint16_t colors[]  = {black, black, rp_leaf, rp_berry};
 
 constexpr int screen_width = 33;
 constexpr int screen_height = 60;
 constexpr int to_screen = 4;
 
 constexpr int racket_size = 8;
-constexpr int racket_line = 57;
+constexpr int racket_line = 55;
 
 constexpr int brick_width = 3;
 constexpr int brick_height = 2;
@@ -62,13 +232,30 @@ struct ball ball;
 int16_t racket = (screen_width - racket_size) / 2;
 game_status game_status;
 
+void sound_on(float freq) {
+    psg_freq(0, freq);
+    psg_freq(1, freq * 1.016);
+    psg_vol(0, VOL_MAX);
+    psg_vol(1, VOL_MAX);
+}
+
+void sound_decay() {
+    if (psg[0].sound_vol > 0) {
+	int v = psg[0].sound_vol * .85;
+//	int v = psg[0].sound_vol >> 1;
+//	v += v >> 1;
+	psg_vol(0, v);
+	psg_vol(1, v);
+    }
+}
+
 int16_t find_brick(uint8_t x, uint8_t y) {
     int16_t result = no_brick;
     if ((x <= screen_width) && (y >= bricks_top) && (y <= bricks_bottom)) {
 	for(int i = 0; i < num_bricks ; i++) {
 	    int dx = x - bricks[i].x;
 	    int dy = y - bricks[i].y;
-	    if (0 <= dx && dx <=brick_width && 0 <= dy && dy <= brick_height) {
+	    if (0 <= dx && dx < brick_width && 0 <= dy && dy < brick_height) {
 		result = i;
 		break;
 	    }
@@ -101,22 +288,6 @@ int16_t hit_brick(uint8_t x, uint8_t y, int8_t* vx, int8_t* vy) {
 
     return no_brick;
 }
-
-using namespace pimoroni;
-
-uint16_t buffer[PicoDisplay::WIDTH * PicoDisplay::HEIGHT];
-PicoDisplay pico_display(buffer);
-
-const uint16_t white = pico_display.create_pen(255, 255, 255);
-const uint16_t black = pico_display.create_pen(0, 0, 0);
-const uint16_t dark_grey = pico_display.create_pen(20, 40, 60);
-const uint16_t yellow = pico_display.create_pen(255, 255, 0);
-
-const uint16_t rp_leaf = pico_display.create_pen(107,192,72);
-const uint16_t rp_berry = pico_display.create_pen(196,25,73);
-const uint16_t colors[] = {black, black, rp_leaf, rp_berry};
-
-const uint16_t bg_color = dark_grey;
 
 void init_bricks() {
     for(int i = 0; i < bricks_lines; i++) {
@@ -152,55 +323,7 @@ void init_ball() {
     ball.vy = 1;
 }
 
-void draw_rect(Rect r) {
-    Rect r2(r.y, PicoDisplay::HEIGHT - r.x - r.w, r.h, r.w);
-    pico_display.rectangle(r2);
-}
-
-void draw_brick(brick b){
-    if (b.exists) {
-	pico_display.set_pen(b.pen);
-    } else {
-	pico_display.set_pen(bg_color);
-    }
-    Rect r(b.x * to_screen, b.y * to_screen, brick_width * to_screen, brick_height * to_screen);
-    draw_rect(r);
-}
-
-void draw_ball(uint16_t color) {
-    Rect r(ball.x * to_screen, ball.y * to_screen, 1 * to_screen, 1 * to_screen);
-    pico_display.set_pen(color);
-    draw_rect(r);
-}
-
-void draw_racket(uint16_t color) {
-    Rect r(racket * to_screen, (racket_line + 1) * to_screen, racket_size * to_screen, 1 * to_screen);
-    pico_display.set_pen(color);
-    draw_rect(r);
-}
-
-void move_racket() {
-    draw_racket(bg_color);
-    if (pico_display.is_pressed(pico_display.X)) {
-	racket += 2;
-	if (racket > screen_width - racket_size) {
-	    racket = screen_width - racket_size;
-	}
-    } else
-	if (pico_display.is_pressed(pico_display.Y)) {
-	    racket -= racket > 2 ? 2 : racket;
-	} else
-	    if (pico_display.is_pressed(pico_display.B)) {
-		racket = ball.x - racket_size / 2;
-	    }
-    draw_racket(white);
-}
-
-void init_all() {
-    pico_display.init();
-    pico_display.set_backlight(70);
-    pico_display.set_pen(bg_color);
-    pico_display.clear();
+void init_game() {
     game_status = Game_Restart;
     init_bricks();
     init_ball();
@@ -209,9 +332,6 @@ void init_all() {
 bool restart_game() {
     if ((ball.y > bricks_bottom) && ball.vy > 0) {
 	init_bricks();
-	for(int i = 0 ; i < num_bricks ; i++) {
-	    draw_brick(bricks[i]);
-	}
 	return true;
     } else {
 	return false;
@@ -226,11 +346,53 @@ bool process_ball() {
 	brick_test = hit_brick(ball.x, ball.y, &ball.vx, &ball.vy);
 	if (brick_test != no_brick) {
 	    bricks[brick_test].exists = false;
-	    draw_brick(bricks[brick_test]);
 	    hit = true;
 	}
     } while (brick_test != no_brick);
     return hit;
+}
+
+void update_ball() {
+    ball.x += ball.vx;
+    if (ball.x >= screen_width - 1 || ball.x < 1) {
+	ball.vx *= -1;
+    }
+
+    ball.y += ball.vy;
+    if (ball.y == 0) {
+	ball.vy *= -1;
+    } else if (ball.y == racket_line) {
+	if (ball.x >= racket && ball.x < racket + racket_size) {
+	    ball.vy *= -1;
+	    sound_on(220);
+	} 
+    } else if (ball.y > racket_line) {
+	if (ball.y > screen_height) {
+	    init_ball();
+	} else {
+	    sound_on(110);
+	}
+    }
+}
+
+void move_racket() {
+    if (button_state & BUTTON_RIGHT) {
+	racket += 2;
+	if (racket > screen_width - racket_size) {
+	    racket = screen_width - racket_size;
+	}
+    } else if (button_state & BUTTON_LEFT) {
+	racket -= racket > 2 ? 2 : racket;
+    }
+
+    if (button_state & BUTTON_MIDDLE) {
+	racket = ball.x - racket_size / 2;
+	if (racket > screen_width - racket_size) {
+	    racket = screen_width - racket_size;
+	} else if (racket < 0) {
+	    racket = 0;
+	}
+    }
 }
 
 void update_game() {
@@ -242,61 +404,161 @@ void update_game() {
 	break;
     case Game_OnGoing:
 	if (process_ball()) {
-	    pico_display.set_led(10,20,60);
-	} else {
-	    pico_display.set_led(0, 0, 0);
+	    sound_on(440);
 	}
 	if (!left_bricks()) {
 	    game_status = Game_Restart;
 	}
 	break;
     }
+
+    update_ball();
+    move_racket();
 }
 
-void update_ball() {
-    draw_ball(bg_color);
+// scanline video renderer
 
-    ball.x += ball.vx;
-    if (ball.x >= screen_width - 1 || ball.x < 1) {
-	ball.vx *= -1;
+#define VGA_MODE vga_mode_320x240_60
+#define MIN_RUN 3
+
+const uint16_t white     = PICO_SCANVIDEO_PIXEL_FROM_RGB8(255, 255, 255);
+const uint16_t dark_grey = PICO_SCANVIDEO_PIXEL_FROM_RGB8(20, 40, 60);
+const uint16_t yellow    = PICO_SCANVIDEO_PIXEL_FROM_RGB8(255, 255, 0);
+const uint16_t dark_blue = PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0, 40);
+
+const uint16_t bg_color  = dark_grey;
+
+const uint16_t racket_color = white | PICO_SCANVIDEO_ALPHA_MASK;
+const uint16_t ball_color  = yellow | PICO_SCANVIDEO_ALPHA_MASK;
+
+constexpr uint16_t brick_wpxls = brick_width * to_screen - 1;
+
+int32_t inline rle_no_brick(uint32_t *buf) {
+    constexpr uint16_t no_brick_w = brick_wpxls * (bricks_rows + 1);
+
+    buf[0] = COMPOSABLE_COLOR_RUN     | (bg_color << 16);
+    buf[1] = no_brick_w - 1 - MIN_RUN | (COMPOSABLE_RAW_1P_SKIP_ALIGN << 16);
+    buf[2] = bg_color;              //| -- the last token is ignored --
+    return 3;
+}
+
+int32_t inline rle_bricks(uint32_t *buf, brick *brick) {
+    for(int i = 0; i < bricks_rows; i++, brick++) {
+	uint16_t color = brick->exists ? brick->pen : bg_color;
+	buf[0] = COMPOSABLE_COLOR_RUN  | (color << 16);
+	buf[1] = brick_wpxls - MIN_RUN | (COMPOSABLE_RAW_1P_SKIP_ALIGN << 16);
+	buf[2] = color;              //| -- the last token is ignored --
+	buf += 3;
     }
+    return 3 * bricks_rows;
+}
 
-    ball.y += ball.vy;
-    if (ball.y == racket_line) {
-	if (ball.x >= racket && ball.x < racket + racket_size) {
-	    ball.vy *= -1;
-	    pico_display.set_led(30,30,30);
-	} else {
-	    pico_display.set_led(0, 0, 0);
-	}
+int32_t scanline_bricks(uint32_t *buf, size_t buf_length, int line_num) {
+    assert(buf_length >= 6 + 3 * bricks_rows);
+    buf[0] = COMPOSABLE_COLOR_RUN  | (dark_blue << 16);
+    buf[1] = 93 - MIN_RUN          | (COMPOSABLE_RAW_1P_SKIP_ALIGN << 16);
+    buf[2] = dark_blue;          //| -- the last token is ignored --
+    buf += 3;
+    
+    int y = line_num / to_screen;
+    int data_used = 0;
+    if ((y >= bricks_top) && (y < bricks_bottom)) {
+	int offset = (y - bricks_top) / brick_height * bricks_rows;
+	data_used = rle_bricks(buf, bricks + offset);
+    } else {
+	data_used = rle_no_brick(buf);
     }
+    
+    buf[data_used] = COMPOSABLE_COLOR_RUN  | (dark_blue << 16);
+    buf[data_used + 1] = 93 - MIN_RUN      | (COMPOSABLE_RAW_1P << 16);
+    buf[data_used + 2] = 0                 | (COMPOSABLE_EOL_ALIGN << 16);
 
-    if (ball.y == 0) {
-	ball.vy *= -1;
+    return data_used + 6;
+}
+
+int32_t inline rle_hline(uint32_t *buf, uint16_t x, uint16_t w, uint16_t c) {
+    buf[0] = COMPOSABLE_COLOR_RUN      | 0;
+    buf[1] = x - MIN_RUN               | (COMPOSABLE_COLOR_RUN << 16);
+    buf[2] = c                         | ((w - MIN_RUN) << 16);
+    buf[3] = COMPOSABLE_RAW_1P         | 0;
+    buf[4] = COMPOSABLE_EOL_SKIP_ALIGN;
+    return 5;
+}
+
+int32_t inline rle_blank_line(uint32_t *buf) {
+    buf[0] = COMPOSABLE_COLOR_RUN     | 0;
+    buf[1] = VGA_MODE.width - MIN_RUN | (COMPOSABLE_EOL_ALIGN << 16);
+    return 2;
+}
+
+int32_t scanline_racket(uint32_t *buf, size_t buf_len, int line_num) {
+    uint16_t racket_x = 94 + racket * to_screen;
+    uint16_t racket_width = racket_size * to_screen;
+    int y = line_num - (racket_line * to_screen);
+
+    if ((y >= 0) && (y < to_screen)) {
+	return rle_hline(buf, racket_x, racket_width, racket_color);
+    } else {
+	return rle_blank_line(buf);
     }
+}
 
-    if (ball.y > screen_height) {
-	init_ball();
+int32_t scanline_ball(uint32_t *buf, size_t buf_len, int line_num) {
+    uint16_t ball_x = 94 + ball.x * to_screen;
+    uint16_t ball_width = to_screen;
+    int y = line_num - (ball.y * to_screen);
+
+    if ((y >= 0) && (y < to_screen)) {
+	return rle_hline(buf, ball_x, ball_width, ball_color);
+    } else {
+	return rle_blank_line(buf);
     }
+}
 
-    draw_ball(yellow);
+void single_scanline(struct scanvideo_scanline_buffer *dest) {
+    uint32_t *buf = dest->data;
+    size_t buf_length = dest->data_max;
+    int line_num = scanvideo_scanline_number(dest->scanline_id);
+
+    dest->data_used = scanline_bricks(dest->data, dest->data_max, line_num);
+    dest->data2_used = scanline_racket(dest->data2, dest->data2_max, line_num);
+    dest->data3_used = scanline_ball(dest->data3, dest->data3_max, line_num);
+    
+    dest->status = SCANLINE_OK;
+}
+
+void frame_update_logic(int num) {
+    if ((num & 1) || (button_state & BUTTON_MIDDLE)) {
+	update_game();
+    }
+    sound_decay();
+}
+
+// main loop
+
+void render_loop() {
+    static uint32_t last_frame_num = 0;
+
+    while (true) {
+        struct scanvideo_scanline_buffer *scanline_buffer = scanvideo_begin_scanline_generation(true);
+
+        uint32_t frame_num = scanvideo_frame_number(scanline_buffer->scanline_id);
+        if (frame_num != last_frame_num) {
+            last_frame_num = frame_num;
+	    frame_update_logic(frame_num);
+        }
+        single_scanline(scanline_buffer);
+	
+        scanvideo_end_scanline_generation(scanline_buffer);
+    }
 }
 
 int main() {
-    init_all();
-
-    while(true) {
-
-	update_game();
-      
-	update_ball();
-	move_racket();
-
-	pico_display.update();
-
-	if (!pico_display.is_pressed(pico_display.A)) {
-	    sleep_ms(32);
-	}
-    }
+    init_game();
+    psg_init();
+    vga_board_init_buttons();
+    scanvideo_setup(&VGA_MODE);
+    scanvideo_timing_enable(true);
+    render_loop();
     return 0;
 }
