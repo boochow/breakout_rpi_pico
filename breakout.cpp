@@ -68,7 +68,7 @@ int16_t find_brick(uint8_t x, uint8_t y) {
     for(int i = 0; i < num_bricks ; i++) {
       int dx = x - bricks[i].x;
       int dy = y - bricks[i].y;
-      if (0 <= dx && dx <=brick_width && 0 <= dy && dy <= brick_height) {
+      if (0 <= dx && dx < brick_width && 0 <= dy && dy < brick_height) {
 	result = i;
 	break;
       }
