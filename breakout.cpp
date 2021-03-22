@@ -198,7 +198,7 @@ void move_racket() {
 
 void init_all() {
   pico_display.init();
-  pico_display.set_backlight(70);
+  pico_display.set_backlight(80);
   pico_display.set_pen(bg_color);
   pico_display.clear();
   game_status = Game_Restart;
